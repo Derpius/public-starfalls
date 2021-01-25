@@ -25,7 +25,7 @@ end
 
 vistrace = {}
 vistrace.ppmMats = {
-    default = parsePPM("raytracer_materials/missingtexture.ppm")
+    --default = parsePPM("raytracer_materials/missingtexture.ppm")
 }
 vistrace.entCache = {}
 
