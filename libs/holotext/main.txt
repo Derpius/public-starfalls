@@ -313,6 +313,7 @@ end
 -- Rendering getters and setters
 function HoloText:getColour() return self.colour end
 function HoloText:setColour(colour)
+    if self.colour == colour then return end
     self.colour = colour
     
     for i = 1, #self.chars do
@@ -327,6 +328,7 @@ function HoloText:setColor(colour) return self:setColour(colour) end
 
 function HoloText:getMaterial() return self.mat end
 function HoloText:setMaterial(mat)
+    if self.mat == mat then return end
     self.mat = mat
     
     for i = 1, #self.chars do
@@ -338,6 +340,7 @@ end
 -- Text getters and setters
 function HoloText:getText() return self.text end
 function HoloText:setText(text)
+    if self.text == text then return end
     self.text = text or ""
     
     -- remove all holos and clear the chars array
@@ -352,16 +355,19 @@ end
 
 function HoloText:getKerning() return self.kerning end
 function HoloText:setKerning(kerning)
+    if self.kerning == kerning then return end
     self.kerning = kerning
     self:_applyTransform(0)
 end
 function HoloText:getSpaceWidth() return self.spaceWidth end
 function HoloText:setSpaceWidth(width)
+    if self.spaceWidth == width then return end
     self.spaceWidth = width
     self:_applyTransform(0)
 end
 function HoloText:getLineHeight() return self.lineHeight end
 function HoloText:setLineHeight(height)
+    if self.lineHeight == height then return end
     self.lineHeight = height
     self:_applyTransform(0)
 end
