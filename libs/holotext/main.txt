@@ -291,18 +291,21 @@ end
 -- Transform getters and setters
 function HoloText:getPos() return self.transform.pos end
 function HoloText:setPos(pos)
+    if self.transform.pos == pos then return end
     self.transform.pos = pos
     self:_applyTransform(0)
 end
 
 function HoloText:getAngles() return self.transform.ang end
 function HoloText:setAngles(ang)
+    if self.transform.ang == ang then return end
     self.transform.ang = ang
     self:_applyTransform(1)
 end
 
 function HoloText:getScale() return self.transform.scale end
 function HoloText:setScale(scale)
+    if self.transform.scale == scale then return end
     self.transform.scale = scale
     self:_applyTransform(2)
 end
