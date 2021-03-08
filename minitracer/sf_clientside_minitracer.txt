@@ -1,14 +1,29 @@
 --@name SF Clientside Minitracer
---@author
+--@author Derpius
 --@client
 
 --[[---------------------------
     PARAMETERS
 -----------------------------]]
-local QUOTA = 0.2 -- Percentage of quota to use
+local QUOTA = 0.3 -- Percentage of quota to use
 local MAX_DEPTH = 5 -- Maximum number of reflections (prevents stack overflow or super long trace times)
-local RES = {128, 128} -- width, height (unsigned integers)
+local BIAS = 0.1 -- How many units to move a ray origin from a surface to prevent shadow acne
+
+local RES = {128, 64} -- width, height (unsigned integers)
 local FOV = 80 -- Field of view of the camera in degrees
+
+local IOR = 1.5 -- Index of refraction for all transparent materials (some good values are 1.3 for water, 1.5 for glass, and 1.8 for diamond)
+
+-- List of models to interpret as spheres (uses the direction from the prop to the hit pos as the normal, rather than the hit normal)
+local SPHERES = {
+    ["models/props_phx/misc/soccerball.mdl"] = true,
+    ["models/hunter/misc/sphere025x025.mdl"] = true,
+    ["models/hunter/misc/sphere075x075.mdl"] = true,
+    ["models/hunter/misc/sphere1x1.mdl"] = true,
+    ["models/hunter/misc/sphere175x175.mdl"] = true,
+    ["models/hunter/misc/sphere2x2.mdl"] = true,
+    ["models/hunter/misc/sphere375x375.mdl"] = true,
+}
 
 --[[---------------------------
    FUNCTION CACHING (local lookup is faster than global)
@@ -24,37 +39,119 @@ function reflect(I, N) -- Reflects an incidence vector I about the normal N
     return I - 2 * N:dot(I) * N
 end
 
+function refract(I, N, ior) -- Refracts an incidence vector I about the normal N through a medium with an index of refraction ior
+    local cosI = I:dot(N)
+    local etaI, etaT = 1, ior
+    
+    if cosI < 0 then
+        cosI = -cosI
+    else
+        etaT, etaI = etaI, ior
+        N = -N
+    end
+    
+    local eta = etaI / etaT
+    local k = 1 - eta^2 * (1 - cosI^2)
+    return k >= 0 and eta * I + (eta * cosI - math.sqrt(k)) * N
+end
+
 local sunDir = game.getSunInfo()
 function traceRay(origin, direction, depth)
     -- Perform a trace
     local hit = trace_trace(origin, direction * 100000 + origin)
-    if not hit.Hit then return Vector(0) end -- If we didn't hit anything just return black
     
+    -- trace.trace wont work from inside an object, which also prevents refraction
+    -- this is a workaround which will work for any object made of a single convex
+    -- otherwise it will trace through the entire object unless something else blocks its path before exiting the other side
+    --
+    -- (note, a more optimised method would be to manually intersect a ray with the object's bounding sphere + padding,
+    -- and trace in from that, however that is outside the scope of this simple example)
+    if hit.StartSolid and not hit.HitWorld then
+        -- perform the trace again but ignore the prop we're inside
+        hit = trace_trace(origin, direction * 100000 + origin, hit.Entity)
+        if not hit.Hit then return Vector() end -- this is the main issue with this simplistic implementation, it requires something to hit on the other side of the object
+        
+        -- trace back towards the start position to determin a point on the surface of the original object that we hit
+        hit = trace_trace(hit.HitPos, origin - direction * 10, hit.Entity)
+    end
+    
+    if not hit.Hit then return Vector() end -- If we didn't hit anything just return black
     if hit.HitSky then return Vector(0, 0.5, 1) end -- If we hit sky return a simple sky colour (this could be expanded with things like skybox tracing and HDRIs)
     
-    -- If we hit the world retrace with traceSurfaceColour
-    local hitColour = Vector()
-    if hit.HitWorld then
-        local colour = render_traceSurfaceColour(origin, direction * 100000 + origin)
-        hitColour = Vector(colour[1] / 255, colour[2] / 255, colour[3] / 255)
-    else
-        local colour = hit.Entity:getColor()
-        hitColour = Vector(colour[1] / 255, colour[2] / 255, colour[3] / 255)
-    end
+    -- If this is one of the models to calculate direction based normals, do that
+    if isValid(hit.Entity) and SPHERES[hit.Entity:getModel()] then hit.HitNormal = (hit.HitPos - hit.Entity:getPos()):getNormalized() end
+    
+    -- If we hit the back face of an object, invert the normal, and note that we're on the inside to invert indices of refraction
+    local inside = direction:dot(hit.HitNormal) > 0
     
     -- Bias the ray hitpos to prevent shadow acne
-    hit.HitPos = hit.HitPos + hit.HitNormal * 0.001
+    local biasOut = hit.HitPos + hit.HitNormal * BIAS
+    local biasIn = hit.HitPos - hit.HitNormal * BIAS
     
-    -- Specular Reflection
-    if isValid(hit.Entity) and hit.Entity:getMaterial() == "debug/env_cubemap_model" and depth < MAX_DEPTH then -- if this is a prop and it has the designated specular material, handle reflection
-        return traceRay(hit.HitPos, reflect(direction, hit.HitNormal), depth + 1) -- Recursively trace reflections, incrementing depth each time
+    local alpha = 1
+    
+    -- DIFFUSE (matte)
+    local diffuse = Vector()
+    
+    if alpha > 0 then -- if the material is completely transparent there's no need to simulate diffuse lighting
+        -- If we hit the world retrace with traceSurfaceColour
+        if hit.HitWorld then
+            local colour = render_traceSurfaceColour(origin, direction * 100000 + origin)
+            diffuse = Vector(colour[1] / 255, colour[2] / 255, colour[3] / 255)
+        else
+            local colour = hit.Entity:getColor() -- get the hit entity's colour
+            alpha = colour[4] / 255 -- normalise the alpha value (transparency)
+            diffuse = Vector(colour[1] / 255, colour[2] / 255, colour[3] / 255) -- normalise the albedo (raw colour)
+        end
+        
+        -- Sun shadowing
+        local proportion = trace_trace(biasOut, sunDir * 100000 + biasOut).HitSky and 1 or 0.5 -- Check if the sky is visible, and reduce lighting if not
+        diffuse = diffuse * proportion * math_max(0.5, hit.HitNormal:dot(sunDir)) -- Simple dot shading
     end
     
-    -- Sun shadowing
-    local proportion = trace_trace(hit.HitPos, sunDir * 100000 + hit.HitPos).HitSky and 1 or 0.5 -- Check if the sky is visible, and reduce lighting if not
-    local directLighting = proportion * math_max(0.5, hit.HitNormal:dot(sunDir)) -- Simple dot shading
+    -- SPECULAR (reflection)
+    -- if the material is the mirror material set fresnel to 1
+    local fresnel = (isValid(hit.Entity) and hit.Entity:getMaterial() == "debug/env_cubemap_model") and 1 or 0
     
-    return hitColour * directLighting
+    local specular = Vector()
+    
+    --if we're below max depth, and the object is transparent or the material is the mirror material, simulate reflection
+    if depth < MAX_DEPTH and (alpha < 1 or fresnel > 0) and not inside then
+        specular = traceRay(inside and biasIn or biasOut, reflect(direction, hit.HitNormal), depth + 1) -- Recursively trace reflections, incrementing depth each time
+    end
+    
+    -- TRANSMISSION (refraction)
+    local transmission = Vector()
+    if depth < MAX_DEPTH and alpha < 1 then -- if the object's alpha is less than 1, simulate transmission
+        -- first, calculate fresnel and make sure this isn't total internal reflection (meaning all light will be reflected, so there's no need simulating transparency)
+        
+        -- we're using Schlick's Approximation to calculate fresnel, as it is far quicker than calculating a perfectly accurate fresnel value
+        -- you can find information on this on wikipedia: https://en.wikipedia.org/wiki/Schlick%27s_approximation
+        local f0
+        if inside then -- if we're inside a medium then we want to swap the indices of refraction to move out from the medium to air
+            f0 = math.abs((IOR - 1) / (IOR + 1))
+        else
+            f0 = math.abs((1 - IOR) / (1 + IOR))
+        end
+        
+        f0 = f0 * f0
+        
+        fresnel = f0 + (1 - f0) * (1 - hit.HitNormal:dot(inside and direction or -direction))^5
+        
+        local refractDir = refract(direction, hit.HitNormal, IOR)
+        if refractDir then transmission = traceRay(inside and biasOut or biasIn, refractDir, depth + 1) end
+    end
+    
+    --[[
+        Final colour is determined by treating the material as having 2 layers
+        the outer specular (reflective) layer
+        and the inner diffuse/transparent layer
+        
+        we use the fresnel equation to determin the ratio between specular and transmission/absorbtion
+        then we determin the ratio between transmission and absorbtion using the alpha value
+    ]]
+    if not inside then return (diffuse * alpha + transmission * (1 - alpha)) * (1 - fresnel) + specular * fresnel end
+    return diffuse * alpha + transmission * (1 - alpha)
 end
 
 --[[---------------------------
@@ -101,7 +198,7 @@ hook.add("renderoffscreen", "renderloop", function()
         
         -- Draw the pixel to the screen
         render_setRGBA(colour[1] * 255, colour[2] * 255, colour[3] * 255, 255)
-        render_drawRectFast(-(ptr % RES[1] - RES[1]), math_floor(ptr / RES[2]), 1, 1)
+        render_drawRectFast(-(ptr % RES[1] - RES[1]) - 1, math_floor(ptr / RES[2]), 1, 1)
         
         -- Increment the pointer for next iteration
         ptr = ptr + 1
@@ -110,6 +207,8 @@ hook.add("renderoffscreen", "renderloop", function()
 end)
 
 hook.add("render", "drawscreenelements", function()
+    render.setFilterMag(1) -- prevent bluring pixels
+
     -- Set the main render target as the texture to draw with
     render.setRenderTargetTexture("main")
     
