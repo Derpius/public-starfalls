@@ -5,10 +5,10 @@
 --[[---------------------------
     PARAMETERS
 -----------------------------]]
-local QUOTA = 0.02 -- Percentage of quota to use
+local QUOTA = 0.2 -- Percentage of quota to use
 local MAX_DEPTH = 5 -- Maximum number of reflections (prevents stack overflow or super long trace times)
-local RES = {64, 64} -- width, height (unsigned integers)
-local FOV = 90 -- Field of view of the camera in degrees
+local RES = {128, 128} -- width, height (unsigned integers)
+local FOV = 80 -- Field of view of the camera in degrees
 
 --[[---------------------------
    FUNCTION CACHING (local lookup is faster than global)
@@ -41,6 +41,9 @@ function traceRay(origin, direction, depth)
         local colour = hit.Entity:getColor()
         hitColour = Vector(colour[1] / 255, colour[2] / 255, colour[3] / 255)
     end
+    
+    -- Bias the ray hitpos to prevent shadow acne
+    hit.HitPos = hit.HitPos + hit.HitNormal * 0.001
     
     -- Specular Reflection
     if isValid(hit.Entity) and hit.Entity:getMaterial() == "debug/env_cubemap_model" and depth < MAX_DEPTH then -- if this is a prop and it has the designated specular material, handle reflection
