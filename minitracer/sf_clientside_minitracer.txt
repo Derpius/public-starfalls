@@ -1,0 +1,115 @@
+--@name SF Clientside Minitracer
+--@author
+--@client
+
+--[[---------------------------
+    PARAMETERS
+-----------------------------]]
+local QUOTA = 0.02 -- Percentage of quota to use
+local MAX_DEPTH = 5 -- Maximum number of reflections (prevents stack overflow or super long trace times)
+local RES = {64, 64} -- width, height (unsigned integers)
+local FOV = 90 -- Field of view of the camera in degrees
+
+--[[---------------------------
+   FUNCTION CACHING (local lookup is faster than global)
+-----------------------------]]
+local math_floor, math_max = math.floor, math.max
+local trace_trace, render_traceSurfaceColour = trace.trace, render.traceSurfaceColor
+local render_selectRenderTarget, render_setRGBA, render_drawRectFast = render.selectRenderTarget, render.setRGBA, render.drawRectFast
+
+--[[---------------------------
+    RAY FUNCTIONS
+-----------------------------]]
+function reflect(I, N) -- Reflects an incidence vector I about the normal N
+    return I - 2 * N:dot(I) * N
+end
+
+local sunDir = game.getSunInfo()
+function traceRay(origin, direction, depth)
+    -- Perform a trace
+    local hit = trace_trace(origin, direction * 100000 + origin)
+    if not hit.Hit then return Vector(0) end -- If we didn't hit anything just return black
+    
+    if hit.HitSky then return Vector(0, 0.5, 1) end -- If we hit sky return a simple sky colour (this could be expanded with things like skybox tracing and HDRIs)
+    
+    -- If we hit the world retrace with traceSurfaceColour
+    local hitColour = Vector()
+    if hit.HitWorld then
+        local colour = render_traceSurfaceColour(origin, direction * 100000 + origin)
+        hitColour = Vector(colour[1] / 255, colour[2] / 255, colour[3] / 255)
+    else
+        local colour = hit.Entity:getColor()
+        hitColour = Vector(colour[1] / 255, colour[2] / 255, colour[3] / 255)
+    end
+    
+    -- Specular Reflection
+    if isValid(hit.Entity) and hit.Entity:getMaterial() == "debug/env_cubemap_model" and depth < MAX_DEPTH then -- if this is a prop and it has the designated specular material, handle reflection
+        return traceRay(hit.HitPos, reflect(direction, hit.HitNormal), depth + 1) -- Recursively trace reflections, incrementing depth each time
+    end
+    
+    -- Sun shadowing
+    local proportion = trace_trace(hit.HitPos, sunDir * 100000 + hit.HitPos).HitSky and 1 or 0.5 -- Check if the sky is visible, and reduce lighting if not
+    local directLighting = proportion * math_max(0.5, hit.HitNormal:dot(sunDir)) -- Simple dot shading
+    
+    return hitColour * directLighting
+end
+
+--[[---------------------------
+    HOLOS
+-----------------------------]]
+local frontHolo = holograms.create(chip():getPos(), Angle(0), "models/sprops/geometry/sphere_3.mdl", Vector(1))
+local rightHolo = holograms.create(chip():getPos(), Angle(0), "models/sprops/geometry/sphere_3.mdl", Vector(1))
+local upHolo = holograms.create(chip():getPos(), Angle(0), "models/sprops/geometry/sphere_3.mdl", Vector(1))
+    
+frontHolo:setColor(Color(255, 0, 0))
+rightHolo:setColor(Color(0, 255, 0))
+upHolo:setColor(Color(0, 0, 255))
+
+hook.add("think", "updateholos", function()
+    frontHolo:setPos(chip():getPos() + chip():getForward() * 5)
+    rightHolo:setPos(chip():getPos() + chip():getRight() * 5)
+    upHolo:setPos(chip():getPos() + chip():getUp() * 5)
+end)
+
+--[[---------------------------
+    RENDERING
+-----------------------------]]
+local ptr = 0 -- pointer to the active pixel we're drawing to
+local scale = {512 * 1024 / RES[1], 512 * 1024 / RES[2]} -- cache RT scale to prevent repetitive calculation
+
+-- Cache camera related variables (these wont change over a trace)
+local camScale = math.tan(math.rad(FOV * 0.5))
+local aspect = RES[1] / RES[2] * camScale
+
+render.createRenderTarget("main") -- Creates a render target to draw to (so our trace persists between render hook calls)
+hook.add("renderoffscreen", "renderloop", function()
+    -- Select the main render target to draw to
+    render_selectRenderTarget("main")
+    
+    -- While we're not close to quota, trace pixels
+    while quotaTotalUsed()/quotaMax() < QUOTA and quotaTotalAverage()/quotaMax() < QUOTA do
+        -- Generate a ray origin and direction from the camera
+        local x = (2 * (ptr % RES[1] + 0.5) / RES[1] - 1) * aspect
+        local y = (1 - 2 * (math_floor(ptr / RES[2]) + 0.5) / RES[2]) * camScale
+        local dir = Vector(1, x, y):getRotated(chip():getAngles())
+        
+        -- Get a colour for this pixel from the ray
+        local colour = traceRay(chip():getPos() + chip():getForward() * 5, dir, 0)
+        
+        -- Draw the pixel to the screen
+        render_setRGBA(colour[1] * 255, colour[2] * 255, colour[3] * 255, 255)
+        render_drawRectFast(-(ptr % RES[1] - RES[1]), math_floor(ptr / RES[2]), 1, 1)
+        
+        -- Increment the pointer for next iteration
+        ptr = ptr + 1
+        if ptr >= RES[1] * RES[2] then ptr = 0 end -- Wrap the pointer around the image (you could also clean up and stop the tracer here if you didn't want it to loop)
+    end
+end)
+
+hook.add("render", "drawscreenelements", function()
+    -- Set the main render target as the texture to draw with
+    render.setRenderTargetTexture("main")
+    
+    -- Draw a rectangle with that render target to the dimensions of the screen
+    render.drawTexturedRect(0, 0, scale[1], scale[2])
+end)
