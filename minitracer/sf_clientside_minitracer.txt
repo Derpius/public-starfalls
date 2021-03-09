@@ -5,14 +5,20 @@
 --[[---------------------------
     PARAMETERS
 -----------------------------]]
-local QUOTA = 0.3 -- Percentage of quota to use
+local QUOTA = 0.2 -- Percentage of quota to use
 local MAX_DEPTH = 5 -- Maximum number of reflections (prevents stack overflow or super long trace times)
 local BIAS = 0.1 -- How many units to move a ray origin from a surface to prevent shadow acne
 
-local RES = {128, 64} -- width, height (unsigned integers)
+local RES = {128, 128} -- width, height (unsigned integers)
 local FOV = 80 -- Field of view of the camera in degrees
 
 local IOR = 1.5 -- Index of refraction for all transparent materials (some good values are 1.3 for water, 1.5 for glass, and 1.8 for diamond)
+local REFLECTION_BOOST = 0.8 -- How much to lerp between the fresnel value and 1 for opaque mirrors (the higher it is the more perfect a reflection you get, but the less natural it looks)
+
+local PHONG_SPECULAR_POWER = 0.2 -- how much of a light's colour should be reflected by phong
+
+local SUN_COLOUR = Vector(3, 2.9, 2.7) -- Light colour and intensity of the sun
+local SHADED_REDUCTION = 0.5 -- Percentage of sun colour to use for shading to fake indirect lighting
 
 -- List of models to interpret as spheres (uses the direction from the prop to the hit pos as the normal, rather than the hit normal)
 local SPHERES = {
@@ -26,11 +32,14 @@ local SPHERES = {
 }
 
 --[[---------------------------
-   FUNCTION CACHING (local lookup is faster than global)
+   CACHING
 -----------------------------]]
-local math_floor, math_max = math.floor, math.max
+local math_floor, math_max, math_abs, math_pi, math_pow, math_lerp = math.floor, math.max, math.abs, math.pi, math.pow, math.lerp
 local trace_trace, render_traceSurfaceColour = trace.trace, render.traceSurfaceColor
 local render_selectRenderTarget, render_setRGBA, render_drawRectFast = render.selectRenderTarget, render.setRGBA, render.drawRectFast
+
+-- material data caching so we don't load entire materials every time we hit a prop
+local matCache = {[""] = 0}
 
 --[[---------------------------
     RAY FUNCTIONS
@@ -76,7 +85,7 @@ function traceRay(origin, direction, depth)
     end
     
     if not hit.Hit then return Vector() end -- If we didn't hit anything just return black
-    if hit.HitSky then return Vector(0, 0.5, 1) end -- If we hit sky return a simple sky colour (this could be expanded with things like skybox tracing and HDRIs)
+    if hit.HitSky then return Vector(0, 0.6, 1) end -- If we hit sky return a simple sky colour (this could be expanded with things like skybox tracing and HDRIs)
     
     -- If this is one of the models to calculate direction based normals, do that
     if isValid(hit.Entity) and SPHERES[hit.Entity:getModel()] then hit.HitNormal = (hit.HitPos - hit.Entity:getPos()):getNormalized() end
@@ -90,28 +99,54 @@ function traceRay(origin, direction, depth)
     
     local alpha = 1
     
-    -- DIFFUSE (matte)
+    -- DIFFUSE AND PHONG (matte and gloss)
+    -- while phong is specular not diffuse, as it's not casting out any extra rays it fits better into the diffuse code
     local diffuse = Vector()
     
     if alpha > 0 then -- if the material is completely transparent there's no need to simulate diffuse lighting
-        -- If we hit the world retrace with traceSurfaceColour
-        if hit.HitWorld then
-            local colour = render_traceSurfaceColour(origin, direction * 100000 + origin)
-            diffuse = Vector(colour[1] / 255, colour[2] / 255, colour[3] / 255)
+        local albedo, phongExp = Vector(), 0
+        if hit.HitWorld then -- If we hit the world retrace with traceSurfaceColour
+            albedo = render_traceSurfaceColour(origin, direction * 100000 + origin)
         else
-            local colour = hit.Entity:getColor() -- get the hit entity's colour
-            alpha = colour[4] / 255 -- normalise the alpha value (transparency)
-            diffuse = Vector(colour[1] / 255, colour[2] / 255, colour[3] / 255) -- normalise the albedo (raw colour)
+            albedo = hit.Entity:getColor() -- get the hit entity's albedo
+            alpha = albedo[4] / 255 -- normalise the alpha value (transparency)
+            
+            -- get phong exponent of prop and cache it
+            local matPath = hit.Entity:getMaterial()
+            if not matCache[matPath] then
+                local materialPhong = material.load(matPath):getInt("$phongexponent")
+                if not materialPhong then matCache[matPath] = 0
+                else matCache[matPath] = materialPhong * 0.58823529411 end -- source maps the 0-255 texture value down to 0-150, this is that mapping
+            end
+            phongExp = matCache[matPath]
         end
+        albedo = Vector(albedo[1] / 255, albedo[2] / 255, albedo[3] / 255) -- normalise the albedo (raw colour)
         
         -- Sun shadowing
-        local proportion = trace_trace(biasOut, sunDir * 100000 + biasOut).HitSky and 1 or 0.5 -- Check if the sky is visible, and reduce lighting if not
-        diffuse = diffuse * proportion * math_max(0.5, hit.HitNormal:dot(sunDir)) -- Simple dot shading
+        local proportion = trace_trace(biasOut, sunDir * 100000 + biasOut).HitSky and SUN_COLOUR or SUN_COLOUR * SHADED_REDUCTION -- Check if the sky is visible, and reduce lighting if not
+        diffuse = albedo / math_pi * proportion * math_max(SHADED_REDUCTION, hit.HitNormal:dot(sunDir)) -- Simple dot shading
+        
+        -- If the hit has a phong value higher than 0, calculate Blinn-Phong
+        if phongExp > 0 then
+            local halfDir = (sunDir - direction):getNormalized()
+            local specAng = math_max(halfDir:dot(hit.HitNormal), 0)
+            local specular = math_pow(specAng, phongExp)
+            diffuse = diffuse + specular * SUN_COLOUR * PHONG_SPECULAR_POWER
+        end
     end
     
     -- SPECULAR (reflection)
-    -- if the material is the mirror material set fresnel to 1
-    local fresnel = (isValid(hit.Entity) and hit.Entity:getMaterial() == "debug/env_cubemap_model") and 1 or 0
+    local fresnel = 0
+    
+    -- if the material is the mirror material and the object isn't transparent, compute a weighted fresnel
+    if alpha == 1 and not inside and isValid(hit.Entity) and hit.Entity:getMaterial() == "debug/env_cubemap_model" then
+        -- we're using Schlick's Approximation to calculate fresnel, as it is far quicker than calculating a perfectly accurate fresnel value
+        -- you can find information on this on wikipedia: https://en.wikipedia.org/wiki/Schlick%27s_approximation
+        local f0 = math_abs((1 - IOR) / (1 + IOR))
+        f0 = f0 * f0
+        
+        fresnel = math_lerp(REFLECTION_BOOST, f0 + (1 - f0) * (1 - hit.HitNormal:dot(inside and direction or -direction))^5, 1)
+    end
     
     local specular = Vector()
     
@@ -129,9 +164,9 @@ function traceRay(origin, direction, depth)
         -- you can find information on this on wikipedia: https://en.wikipedia.org/wiki/Schlick%27s_approximation
         local f0
         if inside then -- if we're inside a medium then we want to swap the indices of refraction to move out from the medium to air
-            f0 = math.abs((IOR - 1) / (IOR + 1))
+            f0 = math_abs((IOR - 1) / (IOR + 1))
         else
-            f0 = math.abs((1 - IOR) / (1 + IOR))
+            f0 = math_abs((1 - IOR) / (1 + IOR))
         end
         
         f0 = f0 * f0
@@ -147,7 +182,7 @@ function traceRay(origin, direction, depth)
         the outer specular (reflective) layer
         and the inner diffuse/transparent layer
         
-        we use the fresnel equation to determin the ratio between specular and transmission/absorbtion
+        We use the fresnel equation to determin the ratio between specular and transmission/absorbtion
         then we determin the ratio between transmission and absorbtion using the alpha value
     ]]
     if not inside then return (diffuse * alpha + transmission * (1 - alpha)) * (1 - fresnel) + specular * fresnel end
@@ -175,7 +210,7 @@ end)
     RENDERING
 -----------------------------]]
 local ptr = 0 -- pointer to the active pixel we're drawing to
-local scale = {512 * 1024 / RES[1], 512 * 1024 / RES[2]} -- cache RT scale to prevent repetitive calculation
+local scale = math.min(512 * 1024 / RES[1], 512 * 1024 / RES[2]) -- cache RT scale to prevent repetitive calculation
 
 -- Cache camera related variables (these wont change over a trace)
 local camScale = math.tan(math.rad(FOV * 0.5))
@@ -198,7 +233,7 @@ hook.add("renderoffscreen", "renderloop", function()
         
         -- Draw the pixel to the screen
         render_setRGBA(colour[1] * 255, colour[2] * 255, colour[3] * 255, 255)
-        render_drawRectFast(-(ptr % RES[1] - RES[1]) - 1, math_floor(ptr / RES[2]), 1, 1)
+        render_drawRectFast(-(ptr % RES[1] - RES[1]) - 1, math_floor(ptr / RES[1]), 1, 1)
         
         -- Increment the pointer for next iteration
         ptr = ptr + 1
@@ -213,5 +248,5 @@ hook.add("render", "drawscreenelements", function()
     render.setRenderTargetTexture("main")
     
     -- Draw a rectangle with that render target to the dimensions of the screen
-    render.drawTexturedRect(0, 0, scale[1], scale[2])
+    render.drawTexturedRect(0, 0, scale, scale)
 end)
