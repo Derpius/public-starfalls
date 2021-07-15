@@ -6,4 +6,4 @@ Uses simple dot shading for the sun, and has perfect specular (mirror) reflectio
 ## Shader Showcase (1024 x 1024)
 From left to right is phong exponent 0, ~5.9, and ~35.3.  
 From top to bottom is alpha 255, 128, and 30.  
-![Showcase](https://github.com/100PXSquared/public-starfalls/blob/master/minitracer/shader%20showcase.png)
+![Showcase](https://github.com/Derpius/public-starfalls/blob/master/minitracer/shader%20showcase.png)
