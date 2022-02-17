@@ -1,0 +1,262 @@
+--@name XInput Gate
+--@author Derpius
+--@shared
+--@model models/jaanus/wiretool/wiretool_input.mdl
+
+--[[
+    Note that this only tracks a single controller via this variable,
+    however the code could ge generalised to all connected controllers
+]]
+local CONTROLLER_ID = 0
+
+-- Stick and trigger deadzone, if any analogue values are below this it'll send nothing over net which is interpreted as 0
+local DEADZONE = 0.06
+
+-- Which analogue inputs were sent
+local ANALOGUE_PACKET_TYPE = {
+    NONE = 0,
+    LEFT = 1,
+    RIGHT = 2,
+    BOTH = 3
+}
+
+local INT16_MAX = 2^15 - 1
+
+if SERVER then
+    -- Enum for bitmasked buttons
+    local XINPUT_GAMEPAD = {
+        DPadUp	         = 0x0001,
+        DPadDown       	= 0x0002,
+        DPadLeft	       = 0x0004,
+        DPadRight	      = 0x0008,
+        Start	          = 0x0010,
+        Back	           = 0x0020,
+        LeftThumbstick	 = 0x0040,
+        RightThumbstick	= 0x0080,
+        LeftBumper	     = 0x0100,
+        RightBumper	    = 0x0200,
+        A              	= 0x1000,
+        B	              = 0x2000,
+        X	              = 0x4000,
+        Y               = 0x8000
+    }
+    
+    wire.adjustOutputs(
+        {
+            "DPadUp", "DPadDown", "DPadLeft", "DPadRight", "DPad",
+            "Start", "Back",
+            "LeftThumbstick", "RightThumbstick",
+            "LeftBumper", "RightBumper",
+            "A", "B", "X", "Y",
+            
+            "LeftStickX", "LeftStickY", "LeftStick",
+            "RightStickX", "RightStickY", "RightStick",
+            "LeftTrigger", "RightTrigger"
+        },
+        {
+            "number", "number", "number", "number", "vector",
+            "number", "number",
+            "number", "number",
+            "number", "number",
+            "number", "number", "number", "number",
+            
+            "number", "number", "vector",
+            "number", "number", "vector",
+            "number", "number"
+        }
+    )
+    
+    local function unpackButtonMask(buttons)
+        local states = {}
+        for name, mask in pairs(XINPUT_GAMEPAD) do
+            states[name] = bit.band(buttons, mask) == 0 and 0 or 1
+            wire.ports[name] = states[name]
+        end
+        
+        wire.ports.DPad = Vector( -- Starfall doesn't have an output converter for VECTOR2
+            states.DPadRight - states.DPadLeft,
+            states.DPadUp - states.DPadDown,
+            0
+        )
+    end
+    
+    --[[
+        Receive update packet
+        
+        Netmsg has the following format
+        Buttons:
+            present: uint1 -- Whether or not the button mask has been sent
+            buttonMask: uint16?
+        Sticks:
+            packetType: ANALOGUE_PACKET_TYPE (uint2)
+            stickX: int16?
+            stickY: int16?
+            stickX: int16?
+            stickY: int16?
+        Triggers: for each set trigger
+            packetType: ANALOGUE_PACKET_TYPE (uint2)
+            triggerVal: uint8?
+            triggerVal: uint8?
+    ]]
+    net.receive("xinputUpdate", function(len, plr)
+        if plr ~= owner() then return end -- Sanity check, should never happen
+        
+        if net.readBool() then
+            unpackButtonMask(net.readUInt(16))
+        end
+        
+        local packetType = net.readUInt(2)
+        if packetType == ANALOGUE_PACKET_TYPE.BOTH or packetType == ANALOGUE_PACKET_TYPE.LEFT then
+            local x, y = net.readInt(16) / INT16_MAX, net.readInt(16) / INT16_MAX
+            wire.ports.LeftStickX = x
+            wire.ports.LeftStickY = y
+            wire.ports.LeftStick = Vector(x, y, 0) -- Starfall doesn't have an output converter for VECTOR2
+        end
+        if packetType == ANALOGUE_PACKET_TYPE.BOTH or packetType == ANALOGUE_PACKET_TYPE.RIGHT then
+            local x, y = net.readInt(16) / INT16_MAX, net.readInt(16) / INT16_MAX
+            wire.ports.RightStickX = x
+            wire.ports.RightStickY = y
+            wire.ports.RightStick = Vector(x, y, 0) -- Starfall doesn't have an output converter for VECTOR2
+        end
+        
+        packetType = net.readUInt(2)
+        if packetType == ANALOGUE_PACKET_TYPE.BOTH or packetType == ANALOGUE_PACKET_TYPE.LEFT then
+            wire.ports.LeftTrigger = net.readUInt(8) / 255
+        end
+        if packetType == ANALOGUE_PACKET_TYPE.BOTH or packetType == ANALOGUE_PACKET_TYPE.RIGHT then
+            wire.ports.RightTrigger = net.readUInt(8) / 255
+        end
+    end)
+elseif player() == owner() then -- CLIENT and running on you
+    -- We dont want to send a separate netmsg every individual controller update, so we cache anything in here then network once per tick
+    -- Also, initialise with the current state, in case the user was holding a button when the chip was spawned
+    local data = {
+        buttons = 0,
+        sticks = {[0] = {0, 0}, {0, 0}},
+        triggers = {[0] = 0, 0}
+    }
+    
+    do
+        local state = xinput.getState(CONTROLLER_ID)
+        if not state then error("Controller not connected") end
+        
+        data.buttons = state.wButtons
+    end
+    
+    local lastSent = {
+        buttons = 0,
+        sticks = {[0] = {0, 0}, {0, 0}},
+        triggers = {[0] = 0, 0}
+    }
+    
+    hook.add("xinputPressed", "", function(id, button)
+        if id ~= CONTROLLER_ID then return end
+        data.buttons = bit.bor(data.buttons, button)
+    end)
+    hook.add("xinputReleased", "", function(id, button)
+        if id ~= CONTROLLER_ID then return end
+        data.buttons = bit.band(data.buttons, bit.bnot(button))
+    end)
+    
+    hook.add("xinputStick", "", function(id, x, y, stickId)
+        if id ~= CONTROLLER_ID then return end
+        if math.abs(x / INT16_MAX) >= DEADZONE or math.abs(y / INT16_MAX) >= DEADZONE then
+            data.sticks[stickId] = {x, y}
+        else
+            data.sticks[stickId] = {0, 0}
+        end
+    end)
+    
+    hook.add("xinputTrigger", "", function(id, val, triggerId)
+        if id ~= CONTROLLER_ID then return end
+        if val / 255 >= DEADZONE then
+            data.triggers[triggerId] = val
+        else
+            data.triggers[triggerId] = 0
+        end
+    end)
+    
+    --[[
+        Send update packet
+        
+        Netmsg has the following format
+        Buttons:
+            present: uint1 -- Whether or not the button mask has been sent
+            buttonMask: uint16?
+        Sticks:
+            packetType: ANALOGUE_PACKET_TYPE (uint2)
+            stickX: int16?
+            stickY: int16?
+            stickX: int16?
+            stickY: int16?
+        Triggers: for each set trigger
+            packetType: ANALOGUE_PACKET_TYPE (uint2)
+            triggerVal: uint8?
+            triggerVal: uint8?
+    ]]
+    hook.add("tick", "", function()
+        net.start("xinputUpdate")
+        
+        -- Buttons
+        if data.buttons ~= lastSent.buttons then
+            net.writeBool(true)
+            net.writeUInt(data.buttons, 16)
+            lastSent.buttons = data.buttons
+        else
+            net.writeBool(false)
+        end
+        
+        -- Sticks
+        if data.sticks[0][1] ~= lastSent.sticks[0][1] or data.sticks[0][2] ~= lastSent.sticks[0][2] then
+            if data.sticks[1][1] ~= lastSent.sticks[1][1] or data.sticks[1][2] ~= lastSent.sticks[1][2] then
+                net.writeUInt(ANALOGUE_PACKET_TYPE.BOTH, 2)
+                net.writeInt(data.sticks[0][1], 16)
+                net.writeInt(data.sticks[0][2], 16)
+                net.writeInt(data.sticks[1][1], 16)
+                net.writeInt(data.sticks[1][2], 16)
+                
+                lastSent.sticks[0][1] = data.sticks[0][1]
+                lastSent.sticks[0][2] = data.sticks[0][2]
+                lastSent.sticks[1][1] = data.sticks[1][1]
+                lastSent.sticks[1][2] = data.sticks[1][2]
+            else
+                net.writeUInt(ANALOGUE_PACKET_TYPE.LEFT, 2)
+                net.writeInt(data.sticks[0][1], 16)
+                net.writeInt(data.sticks[0][2], 16)
+                lastSent.sticks[0][1] = data.sticks[0][1]
+                lastSent.sticks[0][2] = data.sticks[0][2]
+            end
+        elseif data.sticks[1][1] ~= lastSent.sticks[1][1] or data.sticks[1][2] ~= lastSent.sticks[1][2] then
+            net.writeUInt(ANALOGUE_PACKET_TYPE.RIGHT, 2)
+            net.writeInt(data.sticks[1][1], 16)
+            net.writeInt(data.sticks[1][2], 16)
+            lastSent.sticks[1][1] = data.sticks[1][1]
+            lastSent.sticks[1][2] = data.sticks[1][2]
+        else
+            net.writeUInt(ANALOGUE_PACKET_TYPE.NONE, 2)
+        end
+        
+        -- Triggers
+        if data.triggers[0] ~= lastSent.triggers[0] then
+            if data.triggers[1] ~= lastSent.triggers[1] then
+                net.writeUInt(ANALOGUE_PACKET_TYPE.BOTH, 2)
+                net.writeUInt(data.triggers[0], 8)
+                net.writeUInt(data.triggers[1], 8)  
+                lastSent.triggers[0] = data.triggers[0]
+                lastSent.triggers[1] = data.triggers[1]
+            else
+                net.writeUInt(ANALOGUE_PACKET_TYPE.LEFT, 2)
+                net.writeUInt(data.triggers[0], 8)
+                lastSent.triggers[0] = data.triggers[0]
+            end
+        elseif data.triggers[1] ~= lastSent.triggers[1] then
+            net.writeUInt(ANALOGUE_PACKET_TYPE.RIGHT, 2)
+            net.writeUInt(data.triggers[1], 8)
+            lastSent.triggers[1] = data.triggers[1]
+        else
+            net.writeUInt(ANALOGUE_PACKET_TYPE.NONE, 2)
+        end
+        
+        net.send()
+    end)
+end
